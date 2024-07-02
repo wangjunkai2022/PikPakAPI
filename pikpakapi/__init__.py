@@ -8,6 +8,7 @@ import httpx
 
 from .PikpakException import PikpakException
 from .enums import DownloadStatus
+import asyncio
 
 
 class PikPakApi:
@@ -29,7 +30,6 @@ class PikPakApi:
         httpx_client_args: dict - extra arguments for httpx.AsyncClient (https://www.python-httpx.org/api/#asyncclient)
 
     """
-
     PIKPAK_API_HOST = "api-drive.mypikpak.com"
     PIKPAK_USER_HOST = "user.mypikpak.com"
 
@@ -67,7 +67,8 @@ class PikPakApi:
         elif self.username and self.password:
             pass
         else:
-            raise PikpakException("username and password or encoded_token is required")
+            raise PikpakException(
+                "username and password or encoded_token is required")
 
     def get_headers(self, access_token: Optional[str] = None) -> Dict[str, str]:
         """
@@ -86,16 +87,20 @@ class PikPakApi:
         return headers
 
     async def _make_request(
-        self, method: str, url: str, data=None, params=None, headers=None, retry=0 
+        self, method: str, url: str, data=None, params=None, headers=None, retry=0
     ) -> Dict[str, Any]:
         async with httpx.AsyncClient(**self.httpx_client_args) as client:
-            response = await client.request(
-                method,
-                url,
-                json=data,
-                params=params,
-                headers=self.get_headers() if not headers else headers,
-            )
+            try:
+                response = await client.request(
+                    method,
+                    url,
+                    json=data,
+                    params=params,
+                    headers=self.get_headers() if not headers else headers,
+                )
+            except:
+                asyncio.sleep(2)
+                return await self._make_request(method, url, data, params, headers, retry)
             json_data = response.json()
 
             if "error" in json_data:
@@ -158,7 +163,8 @@ class PikPakApi:
             "access_token": self.access_token,
             "refresh_token": self.refresh_token,
         }
-        self.encoded_token = b64encode(json.dumps(token_data).encode()).decode()
+        self.encoded_token = b64encode(
+            json.dumps(token_data).encode()).decode()
 
     async def captcha_init(self) -> None:
         url = f"https://{PikPakApi.PIKPAK_USER_HOST}/v1/shield/captcha/init"
@@ -458,7 +464,8 @@ class PikPakApi:
         paths = path.split("/")
         paths = [p.strip() for p in paths if len(p) > 0]
         # 构造不同级别的path表达式，尝试找到距离目标最近的那一层
-        multi_level_paths = ["/" + "/".join(paths[: i + 1]) for i in range(len(paths))]
+        multi_level_paths = [
+            "/" + "/".join(paths[: i + 1]) for i in range(len(paths))]
         path_ids = [
             self._path_id_cache[p]
             for p in multi_level_paths
@@ -485,7 +492,8 @@ class PikPakApi:
             for f in data.get("files", []):
                 current_path = "/" + "/".join(paths[:count] + [f.get("name")])
                 file_type = (
-                    "folder" if f.get("kind", "").find("folder") != -1 else "file"
+                    "folder" if f.get("kind", "").find(
+                        "folder") != -1 else "file"
                 )
                 record = {
                     "id": f.get("id"),
@@ -501,7 +509,8 @@ class PikPakApi:
                 count += 1
                 parent_id = record_of_target_path["id"]
             elif data.get("next_page_token") and (
-                not next_page_token or next_page_token != data.get("next_page_token")
+                not next_page_token or next_page_token != data.get(
+                    "next_page_token")
             ):
                 next_page_token = data.get("next_page_token")
             elif create:
@@ -756,7 +765,7 @@ class PikPakApi:
             url=f"https://{self.PIKPAK_API_HOST}/vip/v1/activity/inviteCode",
         )
         return result["code"]
-    
+
     async def vip_info(self):
         result = await self._request_get(
             url=f"https://{self.PIKPAK_API_HOST}/drive/v1/privilege/vip",
