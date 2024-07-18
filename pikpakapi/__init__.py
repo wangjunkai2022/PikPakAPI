@@ -1,14 +1,24 @@
 import binascii
+from hashlib import md5
 import json
+import logging
+import asyncio
 from base64 import b64decode, b64encode
 from typing import Any, Dict, List, Optional
-
+from .utils import (
+    CLIENT_ID,
+    CLIENT_SECRET,
+    CLIENT_VERSION,
+    PACKAG_ENAME,
+    build_custom_user_agent,
+    captcha_sign,
+    get_timestamp,
+)
 import httpx
 
 
 from .PikpakException import PikpakException
 from .enums import DownloadStatus
-import asyncio
 
 
 class PikPakApi:
@@ -30,11 +40,9 @@ class PikPakApi:
         httpx_client_args: dict - extra arguments for httpx.AsyncClient (https://www.python-httpx.org/api/#asyncclient)
 
     """
+
     PIKPAK_API_HOST = "api-drive.mypikpak.com"
     PIKPAK_USER_HOST = "user.mypikpak.com"
-
-    CLIENT_ID = "YNxT9w7GMdWvEOKa"
-    CLIENT_SECRET = "dbw2OtmVEeuUvIptb1Coygx"
 
     def __init__(
         self,
@@ -42,6 +50,7 @@ class PikPakApi:
         password: Optional[str] = None,
         encoded_token: Optional[str] = None,
         httpx_client_args: Optional[Dict[str, Any]] = {},
+        device_id: Optional[str] = None,
     ):
         """
         username: str - username of the user
@@ -58,24 +67,45 @@ class PikPakApi:
         self.refresh_token = None
         self.user_id = None
 
-        self.httpx_client_args = httpx_client_args
+        # device_id is used to identify the device, if not provided, a random device_id will be generated, 32 characters
+        self.device_id = (
+            device_id
+            if device_id
+            else md5(f"{self.username}{self.password}".encode()).hexdigest()
+        )
+        self.captcha_token = None
+
+        self.httpx_client = httpx.AsyncClient(**httpx_client_args)
 
         self._path_id_cache = {}
+
+        self.user_agent: Optional[str] = None
 
         if self.encoded_token:
             self.decode_token()
         elif self.username and self.password:
             pass
         else:
-            raise PikpakException(
-                "username and password or encoded_token is required")
+            raise PikpakException("username and password or encoded_token is required")
+
+    def build_custom_user_agent(self) -> str:
+
+        self.user_agent = build_custom_user_agent(
+            device_id=self.device_id,
+            user_id=self.user_id if self.user_id else "",
+        )
+        return self.user_agent
 
     def get_headers(self, access_token: Optional[str] = None) -> Dict[str, str]:
         """
         Returns the headers to use for the requests.
         """
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36",
+            "User-Agent": (
+                self.build_custom_user_agent()
+                if self.captcha_token
+                else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            ),
             "Content-Type": "application/json; charset=utf-8",
         }
 
@@ -83,36 +113,64 @@ class PikPakApi:
             headers["Authorization"] = f"Bearer {self.access_token}"
         if access_token:
             headers["Authorization"] = f"Bearer {access_token}"
-
+        if self.captcha_token:
+            headers["X-Captcha-Token"] = self.captcha_token
+        if self.device_id:
+            headers["X-Device-Id"] = self.device_id
         return headers
 
     async def _make_request(
-        self, method: str, url: str, data=None, params=None, headers=None, retry=0
+        self, method: str, url: str, data=None, params=None, headers=None
     ) -> Dict[str, Any]:
-        async with httpx.AsyncClient(**self.httpx_client_args) as client:
+        backoff_seconds = 3
+        error_decription = ""
+        for i in range(3):  # retries
+            # headers can be different for each request with captcha
+            if headers is None:
+                req_headers = self.get_headers()
+            else:
+                req_headers = headers
             try:
-                response = await client.request(
+                response = await self.httpx_client.request(
                     method,
                     url,
                     json=data,
                     params=params,
-                    headers=self.get_headers() if not headers else headers,
+                    headers=req_headers,
                 )
-            except:
-                asyncio.sleep(2)
-                return await self._make_request(method, url, data, params, headers, retry)
-            json_data = response.json()
+            except httpx.HTTPError as e:
+                logging.error(e)
+                await asyncio.sleep(backoff_seconds)
+                backoff_seconds *= 2  # exponential backoff
+                continue
+            except KeyboardInterrupt as e:
+                sys.exit(0)
+            except Exception as e:
+                logging.error(e)
+                await asyncio.sleep(backoff_seconds)
+                backoff_seconds *= 2  # exponential backoff
+                continue
 
-            if "error" in json_data:
-                if json_data.get("error_code") == 16:
-                    await self.refresh_access_token()
-                    return await self._make_request(method, url, data, params)
-                else:
-                    while retry <= 3:
-                        retry += 1
-                        await self._make_request(method, url, data, params, headers, retry)
-                    raise PikpakException(f"{json_data['error_description']}")
-            return json_data
+            json_data = response.json()
+            if json_data and "error" not in json_data:
+                # ok
+                return json_data
+
+            if not json_data:
+                error_decription = "empty json data"
+                await asyncio.sleep(backoff_seconds)
+                backoff_seconds *= 2  # exponential backoff
+                continue
+            elif json_data["error_code"] == 16:
+                await self.refresh_access_token()
+                continue
+                # goes to next iteration in retry loop
+            else:
+                await asyncio.sleep(backoff_seconds)
+                backoff_seconds *= 2  # exponential backoff
+                continue
+
+        raise PikpakException(error_decription)
 
     async def _request_get(
         self,
@@ -163,16 +221,24 @@ class PikPakApi:
             "access_token": self.access_token,
             "refresh_token": self.refresh_token,
         }
-        self.encoded_token = b64encode(
-            json.dumps(token_data).encode()).decode()
+        self.encoded_token = b64encode(json.dumps(token_data).encode()).decode()
 
-    async def captcha_init(self) -> None:
+    async def captcha_init(self, action: str, meta: dict = None) -> Dict[str, Any]:
         url = f"https://{PikPakApi.PIKPAK_USER_HOST}/v1/shield/captcha/init"
+        if not meta:
+            t = f"{get_timestamp()}"
+            meta = {
+                "captcha_sign": captcha_sign(self.device_id, t),
+                "client_version": CLIENT_VERSION,
+                "package_name": PACKAG_ENAME,
+                "user_id": self.user_id,
+                "timestamp": t,
+            }
         params = {
-            "client_id": "YUMx5nI8ZU8Ap8pm",
-            "action": "POST:/v1/auth/signin",
+            "client_id": CLIENT_ID,
+            "action": action,
             "device_id": self.device_id,
-            "meta": {"email": self.username},
+            "meta": meta,
         }
         return await self._request_post(url, data=params)
 
@@ -182,8 +248,8 @@ class PikPakApi:
         """
         login_url = f"https://{PikPakApi.PIKPAK_USER_HOST}/v1/auth/token"
         login_data = {
-            "client_id": self.CLIENT_ID,
-            "client_secret": self.CLIENT_SECRET,
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
             "password": self.password,
             "username": self.username,
             "grant_type": "password",
@@ -206,7 +272,7 @@ class PikPakApi:
         """
         refresh_url = f"https://{self.PIKPAK_USER_HOST}/v1/auth/token"
         refresh_data = {
-            "client_id": self.CLIENT_ID,
+            "client_id": CLIENT_ID,
             "refresh_token": self.refresh_token,
             "grant_type": "refresh_token",
         }
@@ -464,8 +530,7 @@ class PikPakApi:
         paths = path.split("/")
         paths = [p.strip() for p in paths if len(p) > 0]
         # 构造不同级别的path表达式，尝试找到距离目标最近的那一层
-        multi_level_paths = [
-            "/" + "/".join(paths[: i + 1]) for i in range(len(paths))]
+        multi_level_paths = ["/" + "/".join(paths[: i + 1]) for i in range(len(paths))]
         path_ids = [
             self._path_id_cache[p]
             for p in multi_level_paths
@@ -492,8 +557,7 @@ class PikPakApi:
             for f in data.get("files", []):
                 current_path = "/" + "/".join(paths[:count] + [f.get("name")])
                 file_type = (
-                    "folder" if f.get("kind", "").find(
-                        "folder") != -1 else "file"
+                    "folder" if f.get("kind", "").find("folder") != -1 else "file"
                 )
                 record = {
                     "id": f.get("id"),
@@ -509,8 +573,7 @@ class PikPakApi:
                 count += 1
                 parent_id = record_of_target_path["id"]
             elif data.get("next_page_token") and (
-                not next_page_token or next_page_token != data.get(
-                    "next_page_token")
+                not next_page_token or next_page_token != data.get("next_page_token")
             ):
                 next_page_token = data.get("next_page_token")
             elif create:
@@ -625,9 +688,14 @@ class PikPakApi:
         1. Use `medias[0][link][url]` for streaming with high speed in streaming services or tools.
         2. Use `web_content_link` to download the file
         """
-        result = await self._request_get(
-            url=f"https://{self.PIKPAK_API_HOST}/drive/v1/files/{file_id}?_magic=2021&thumbnail_size=SIZE_LARGE",
+        result = await self.captcha_init(
+            action=f"GET:/drive/v1/files/{file_id}",
         )
+        self.captcha_token = result.get("captcha_token")
+        result = await self._request_get(
+            url=f"https://{self.PIKPAK_API_HOST}/drive/v1/files/{file_id}?",
+        )
+        self.captcha_token = None
         return result
 
     async def file_rename(self, id: str, new_file_name: str) -> Dict[str, Any]:
