@@ -1,12 +1,18 @@
+import asyncio
 import binascii
-from hashlib import md5
+import inspect
 import json
 import logging
-import asyncio
-from base64 import b64decode, b64encode
-import sys
 import re
-from typing import Any, Dict, List, Optional
+from base64 import b64decode, b64encode
+from hashlib import md5
+from types import NoneType
+from typing import Any, Dict, List, Optional, Callable, Coroutine
+
+import httpx
+
+from .PikpakException import PikpakException, PikpakRetryException
+from .enums import DownloadStatus
 from .utils import (
     CLIENT_ID,
     CLIENT_SECRET,
@@ -16,11 +22,6 @@ from .utils import (
     captcha_sign,
     get_timestamp,
 )
-import httpx
-
-
-from .PikpakException import PikpakException
-from .enums import DownloadStatus
 
 
 class PikPakApi:
@@ -28,8 +29,6 @@ class PikPakApi:
     PikPakApi class
 
     Attributes:
-        CLIENT_ID: str - PikPak API client id
-        CLIENT_SECRET: str - PikPak API client secret
         PIKPAK_API_HOST: str - PikPak API host
         PIKPAK_USER_HOST: str - PikPak user API host
 
@@ -39,8 +38,8 @@ class PikPakApi:
         access_token: str - access token of the user , expire in 7200
         refresh_token: str - refresh token of the user
         user_id: str - user id of the user
-        httpx_client_args: dict - extra arguments for httpx.AsyncClient (https://www.python-httpx.org/api/#asyncclient)
-
+        token_refresh_callback: Callable[[PikPakApi, **Any], Coroutine[Any, Any, None]] - async callback function to be called after token refresh
+        token_refresh_callback_kwargs: Dict[str, Any] - custom arguments to be passed to the token refresh callback
     """
 
     PIKPAK_API_HOST = "api-drive.mypikpak.com"
@@ -51,19 +50,32 @@ class PikPakApi:
         username: Optional[str] = None,
         password: Optional[str] = None,
         encoded_token: Optional[str] = None,
-        httpx_client_args: Optional[Dict[str, Any]] = {},
+        httpx_client_args: Optional[Dict[str, Any]] = None,
         device_id: Optional[str] = None,
+        request_max_retries: int = 3,
+        request_initial_backoff: float = 3.0,
+        token_refresh_callback: Optional[Callable] = None,
+        token_refresh_callback_kwargs: Optional[Dict[str, Any]] = None,
     ):
         """
         username: str - username of the user
         password: str - password of the user
         encoded_token: str - encoded token of the user with access and refresh token
         httpx_client_args: dict - extra arguments for httpx.AsyncClient (https://www.python-httpx.org/api/#asyncclient)
+        device_id: str - device id to identify the device
+        request_max_retries: int - maximum number of retries for requests
+        request_initial_backoff: float - initial backoff time for retries
+        token_refresh_callback: Callable[[PikPakApi, **Any], Coroutine[Any, Any, None]] - async callback function to be called after token refresh
+        token_refresh_callback_kwargs: Dict[str, Any] - custom arguments to be passed to the token refresh callback
         """
 
         self.username = username
         self.password = password
         self.encoded_token = encoded_token
+        self.max_retries = request_max_retries
+        self.initial_backoff = request_initial_backoff
+        self.token_refresh_callback = token_refresh_callback
+        self.token_refresh_callback_kwargs = token_refresh_callback_kwargs or {}
 
         self.access_token = None
         self.refresh_token = None
@@ -77,9 +89,8 @@ class PikPakApi:
         )
         self.captcha_token = None
 
-        self.httpx_client = httpx.AsyncClient(
-            **httpx_client_args if httpx_client_args else {}
-        )
+        httpx_client_args = httpx_client_args or {"timeout": 10}
+        self.httpx_client = httpx.AsyncClient(**httpx_client_args)
 
         self._path_id_cache: Dict[str, Any] = {}
 
@@ -91,6 +102,34 @@ class PikPakApi:
             pass
         else:
             raise PikpakException("username and password or encoded_token is required")
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PikPakApi":
+        """
+        Create PikPakApi object from a dictionary
+        """
+        params = inspect.signature(cls).parameters
+        filtered_data = {key: data[key] for key in params if key in data}
+        client = cls(
+            **filtered_data,
+        )
+        client.__dict__.update(data)
+        return client
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Returns the PikPakApi object as a dictionary
+        """
+        data = self.__dict__.copy()
+        # remove can't be serialized attributes
+        keys_to_delete = [
+            k
+            for k, v in data.items()
+            if not type(v) in [str, int, float, bool, list, dict, NoneType]
+        ]
+        for k in keys_to_delete:
+            del data[k]
+        return data
 
     def build_custom_user_agent(self) -> str:
 
@@ -124,62 +163,74 @@ class PikPakApi:
         return headers
 
     async def _make_request(
-        self, method: str, url: str, data=None, params=None, headers=None
+        self,
+        method: str,
+        url: str,
+        data: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        backoff_seconds = 3
-        error_decription = ""
-        for i in range(3):  # retries
-            # headers can be different for each request with captcha
-            if headers is None:
-                req_headers = self.get_headers()
-            else:
-                req_headers = headers
+        last_error = None
+
+        for attempt in range(self.max_retries):
             try:
-                response = await self.httpx_client.request(
-                    method,
-                    url,
-                    json=data,
-                    params=params,
-                    headers=req_headers,
+                response = await self._send_request(method, url, data, params, headers)
+                return await self._handle_response(response)
+            except PikpakRetryException as error:
+                logging.info(f"Retry attempt {attempt + 1}/{self.max_retries}")
+                last_error = error
+            except PikpakException:
+                raise
+            except httpx.HTTPError as error:
+                logging.error(
+                    f"HTTP Error on attempt {attempt + 1}/{self.max_retries}: {str(error)}"
                 )
-            except httpx.HTTPError as e:
-                logging.error(e)
-                await asyncio.sleep(backoff_seconds)
-                backoff_seconds *= 2  # exponential backoff
-                continue
-            except KeyboardInterrupt as e:
-                sys.exit(0)
-            except Exception as e:
-                logging.error(e)
-                await asyncio.sleep(backoff_seconds)
-                backoff_seconds *= 2  # exponential backoff
-                continue
+                last_error = error
+            except Exception as error:
+                logging.error(
+                    f"Unexpected error on attempt {attempt + 1}/{self.max_retries}: {str(error)}"
+                )
+                last_error = error
 
+            await asyncio.sleep(self.initial_backoff * (2**attempt))
+
+        # If we've exhausted all retries, raise an exception with the last error
+        raise PikpakException(f"Max retries reached. Last error: {str(last_error)}")
+
+    async def _send_request(self, method, url, data, params, headers):
+        req_headers = headers or self.get_headers()
+        return await self.httpx_client.request(
+            method,
+            url,
+            json=data,
+            params=params,
+            headers=req_headers,
+        )
+
+    async def _handle_response(self, response) -> Dict[str, Any]:
+        try:
             json_data = response.json()
-            if json_data and "error" not in json_data:
-                # ok
-                return json_data
+        except ValueError:
+            if response.status_code == 200:
+                return {}
+            raise PikpakRetryException("Empty JSON data")
 
-            if not json_data:
-                error_decription = "empty json data"
-                await asyncio.sleep(backoff_seconds)
-                backoff_seconds *= 2  # exponential backoff
-                continue
-            elif json_data["error_code"] == 16:
-                await self.refresh_access_token()
-                continue
-                # goes to next iteration in retry loop
-            else:
-                await asyncio.sleep(backoff_seconds)
-                backoff_seconds *= 2  # exponential backoff
-                continue
+        if not json_data:
+            if response.status_code == 200:
+                return {}
+            raise PikpakRetryException("Empty JSON data")
 
-        if error_decription == "" and "error_description" in json_data.keys():
-            error_decription = json_data["error_description"]
-        else:
-            error_decription = "Unknown Error"
+        if "error" not in json_data:
+            return json_data
 
-        raise PikpakException(error_decription)
+        if json_data["error"] == "invalid_account_or_password":
+            raise PikpakException("Invalid username or password")
+
+        if json_data.get("error_code") == 16:
+            await self.refresh_access_token()
+            raise PikpakRetryException("Token refreshed, please retry")
+
+        raise PikpakException(json_data.get("error_description", "Unknown Error"))
 
     async def _request_get(
         self,
@@ -306,6 +357,10 @@ class PikPakApi:
         self.refresh_token = user_info["refresh_token"]
         self.user_id = user_info["sub"]
         self.encode_token()
+        if self.token_refresh_callback:
+            await self.token_refresh_callback(
+                self, **self.token_refresh_callback_kwargs
+            )
 
     def get_user_info(self) -> Dict[str, Optional[str]]:
         """
@@ -574,7 +629,6 @@ class PikPakApi:
 
         next_page_token = None
         while count < len(paths):
-            current_parent_path = "/" + "/".join(paths[:count])
             data = await self.file_list(
                 parent_id=parent_id, next_page_token=next_page_token
             )
@@ -603,9 +657,9 @@ class PikPakApi:
                 next_page_token = data.get("next_page_token")
             elif create:
                 data = await self.create_folder(name=paths[count], parent_id=parent_id)
-                id = data.get("file").get("id")
+                file_id = data.get("file").get("id")
                 record = {
-                    "id": id,
+                    "id": file_id,
                     "name": paths[count],
                     "file_type": "folder",
                 }
@@ -613,7 +667,7 @@ class PikPakApi:
                 current_path = "/" + "/".join(paths[: count + 1])
                 self._path_id_cache[current_path] = record
                 count += 1
-                parent_id = id
+                parent_id = file_id
             else:
                 break
         return path_ids
@@ -690,8 +744,8 @@ class PikPakApi:
         from_ids: List[str] = []
         for path in from_path:
             if path_ids := await self.path_to_id(path):
-                if id := path_ids[-1].get("id"):
-                    from_ids.append(id)
+                if file_id := path_ids[-1].get("id"):
+                    from_ids.append(file_id)
         if not from_ids:
             raise PikpakException("要移动的文件不存在")
         to_path_ids = await self.path_to_id(to_path, create=create)
@@ -871,4 +925,74 @@ class PikPakApi:
         """
         url = f"https://{self.PIKPAK_API_HOST}/vip/v1/quantity/list?type=transfer"
         result = await self._request_get(url)
+        return result
+
+    async def get_share_folder(
+        self, share_id: str, pass_code_token: str, parent_id: str = None
+    ) -> Dict[str, Any]:
+        """
+        获取分享链接下文件夹内容
+
+        Args:
+            share_id: str - 分享ID eg. /s/VO8BcRb-XXXXX 的 VO8BcRb-XXXXX
+            pass_code_token: str - 通过 get_share_info 获取到的 pass_code_token
+            parent_id: str - 父文件夹id, 默认列出根目录
+        """
+        data = {
+            "limit": "100",
+            "thumbnail_size": "SIZE_LARGE",
+            "order": "6",
+            "share_id": share_id,
+            "parent_id": parent_id,
+            "pass_code_token": pass_code_token,
+        }
+        url = f"https://{self.PIKPAK_API_HOST}/drive/v1/share/detail"
+        return await self._request_get(url, params=data)
+
+    async def get_share_info(
+        self, share_link: str, pass_code: str = None
+    ) -> ValueError | Dict[str, Any] | List[Dict[str | Any, str | Any]]:
+        """
+        获取分享链接下内容
+
+        Args:
+            share_link: str - 分享链接
+            pass_code: str - 分享密码, 无密码则留空
+        """
+        match = re.search(r"/s/([^/]+)(?:.*/([^/]+))?$", share_link)
+        if match:
+            share_id = match.group(1)
+            parent_id = match.group(2) if match.group(2) else None
+        else:
+            return ValueError("Share Link Is Not Right")
+
+        data = {
+            "limit": "100",
+            "thumbnail_size": "SIZE_LARGE",
+            "order": "3",
+            "share_id": share_id,
+            "parent_id": parent_id,
+            "pass_code": pass_code,
+        }
+        url = f"https://{self.PIKPAK_API_HOST}/drive/v1/share"
+        return await self._request_get(url, params=data)
+
+    async def restore(
+        self, share_id: str, pass_code_token: str, file_ids: List[str]
+    ) -> Dict[str, Any]:
+        """
+
+        Args:
+            share_id: 分享链接eg. /s/VO8BcRb-XXXXX 的 VO8BcRb-XXXXX
+            pass_code_token: get_share_info获取, 无密码则留空
+            file_ids: 需要转存的文件/文件夹ID列表, get_share_info获取id值
+        """
+        data = {
+            "share_id": share_id,
+            "pass_code_token": pass_code_token,
+            "file_ids": file_ids,
+        }
+        result = await self._request_post(
+            url=f"https://{self.PIKPAK_API_HOST}/drive/v1/share/restore", data=data
+        )
         return result

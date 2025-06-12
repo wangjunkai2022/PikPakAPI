@@ -1,9 +1,14 @@
 import asyncio
 import json
+import logging
 
 import httpx
 
 from pikpakapi import PikPakApi
+
+
+async def log_token(client, extra_data):
+    logging.info(f"Token: {client.encoded_token}, Extra Data: {extra_data}")
 
 
 async def test():
@@ -14,9 +19,16 @@ async def test():
             "proxy": "http://127.0.0.1:1081",
             "transport": httpx.AsyncHTTPTransport(retries=3),
         },
+        token_refresh_callback=log_token,
+        token_refresh_callback_kwargs={"extra_data": "test"},
     )
     await client.login()
     await client.refresh_access_token()
+    tasks = await client.offline_list()
+    print(json.dumps(tasks, indent=4))
+    print("=" * 30, end="\n\n")
+    if tasks.get("tasks"):
+        await client.delete_tasks(task_ids=[tasks["tasks"][0]["id"]])
     print(json.dumps(client.get_user_info(), indent=4))
     print("=" * 30, end="\n\n")
 
@@ -80,6 +92,56 @@ async def test():
     print(json.dumps(await client.get_quota_info(), indent=4))
     print("=" * 30, end="\n\n")
 
+    print(
+        json.dumps(
+            await client.get_share_info(
+                "https://mypikpak.com/s/VO8BcRb-0fibD0Ncymp8nxSMo1"
+            ),
+            indent=4,
+        )
+    )
+
+    test_restore = await client.get_share_info(
+        "https://mypikpak.com/s/VO8BcRb-0fibD0Ncymp8nxSMo1/VO8Ba45l-FRcCf559uZjwjFjo1"
+    )
+
+    await client.restore(
+        share_id="VO8BcRb-0fibD0Ncymp8nxSMo1",
+        pass_code_token=test_restore.get("pass_code_token"),
+        file_ids=[
+            "VO8BcNTLpxHtBHDFH0d5cGRzo1",
+        ],
+    )
+
+
+async def test_save():
+    client = PikPakApi(
+        username="your_username",
+        password="your_password",
+    )
+    await client.login()
+    await client.refresh_access_token()
+    with open("pikpak.json", "w") as f:
+        f.write(json.dumps(client.to_dict(), indent=4))
+
+    with open("pikpak.json", "r") as f:
+        data = json.load(f)
+        client = PikPakApi.from_dict(data)
+        await client.refresh_access_token()
+        print(json.dumps(client.get_user_info(), indent=4))
+        print(
+            json.dumps(
+                await client.get_share_info(
+                    "https://mypikpak.com/s/VO8BcRb-0fibD0Ncymp8nxSMo1"
+                ),
+                indent=4,
+            )
+        )
+
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    )
     asyncio.run(test())
+    asyncio.run(test_save())
